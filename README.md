@@ -54,7 +54,31 @@ python langcheck.py --lang de --all-strings strings.json          # every string
 
 Exit code: `0` clean, `1` findings, `2` bad input (for example, no language).
 
-## Use it as a gate
+## GitHub Action
+
+Fail a pull request when the copy has a mistake:
+
+```yaml
+# .github/workflows/copy.yml
+name: copy
+on: [pull_request]
+jobs:
+  langcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terezakohutova/copy-langcheck@main
+        with:
+          files: copy/cz-ads.json copy/sk-landing.html
+          lang: ''            # empty = each file says its own (HTML lang, JSON "lang")
+          languagetool: true  # starts a LanguageTool container on the runner
+          online: true        # false = no Korektor, all text stays on the runner
+          ignore: copy/brand-words.txt
+```
+
+The action's own self-test ([`.github/workflows/selftest.yml`](.github/workflows/selftest.yml)) checks both directions on every push: clean Slovak copy must pass, and the planted mistakes in `examples/` must fail.
+
+## Use it as a gate locally
 
 ```
 python langcheck.py --lang cs ad-copy.json || { echo "fix the copy first"; exit 1; }

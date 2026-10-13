@@ -1,0 +1,71 @@
+name: copy-langcheck
+description: Spelling and grammar gate for marketing copy in Czech, Slovak, Polish, German and English (Hunspell + LanguageTool + Korektor). Fails the job when the copy has a mistake.
+branding:
+  icon: check-circle
+  color: green
+inputs:
+  files:
+    description: Files to check, separated by spaces or new lines (text, Markdown, HTML or JSON).
+    required: true
+  lang:
+    description: Language (cs, sk, pl, de, en). Leave empty when every file states its own (HTML lang, JSON "lang").
+    required: false
+    default: ''
+  all-strings:
+    description: For JSON files, check every string value, not only the known copy keys.
+    required: false
+    default: 'false'
+  languagetool:
+    description: Start a LanguageTool server for grammar (sk, pl, de, en). Adds about a minute.
+    required: false
+    default: 'true'
+  online:
+    description: Use Korektor (public LINDAT API) for Czech. Set to false to keep all text on the runner.
+    required: false
+    default: 'true'
+  ignore:
+    description: Path to a file with words that are right on purpose, one per line.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install spylls and dictionaries
+      shell: bash
+      run: |
+        pip install -q -r "$GITHUB_ACTION_PATH/requirements.txt"
+        python "$GITHUB_ACTION_PATH/fetch_dicts.py"
+    - name: Start LanguageTool
+      if: inputs.languagetool == 'true'
+      shell: bash
+      run: |
+        docker run -d --name languagetool -p 8081:8010 erikvl87/languagetool >/dev/null
+        for i in $(seq 1 60); do
+          curl -sf "http://localhost:8081/v2/check?language=en-GB&text=Test." >/dev/null && { echo "LanguageTool up after ${i}x2 s"; exit 0; }
+          sleep 2
+        done
+        echo "::warning::LanguageTool did not start, grammar will not be checked"
+    - name: Check the copy
+      shell: bash
+      env:
+        INPUT_FILES: ${{ inputs.files }}
+        INPUT_LANG: ${{ inputs.lang }}
+        INPUT_ALL: ${{ inputs.all-strings }}
+        INPUT_ONLINE: ${{ inputs.online }}
+        INPUT_IGNORE: ${{ inputs.ignore }}
+      run: |
+        args=()
+        [ -n "$INPUT_LANG" ] && args+=(--lang "$INPUT_LANG")
+        [ "$INPUT_ALL" = "true" ] && args+=(--all-strings)
+        [ "$INPUT_ONLINE" = "true" ] || args+=(--no-online)
+        [ -n "$INPUT_IGNORE" ] && args+=(--ignore "$INPUT_IGNORE")
+        status=0
+        for f in $INPUT_FILES; do
+          echo "::group::$f"
+          python "$GITHUB_ACTION_PATH/langcheck.py" "${args[@]}" "$f" || status=1
+          echo "::endgroup::"
+        done
+        exit $status

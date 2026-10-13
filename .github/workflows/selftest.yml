@@ -1,0 +1,31 @@
+name: selftest
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  clean-copy-passes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          files: examples/clean-sk.txt
+          lang: sk
+
+  bad-copy-fails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: check
+        uses: ./
+        continue-on-error: true
+        with:
+          files: examples/ad-copy.json examples/landing-pl.html
+      - name: The planted mistakes must be caught
+        run: |
+          if [ "${{ steps.check.outcome }}" != "failure" ]; then
+            echo "::error::the examples contain mistakes, the check should have failed"; exit 1
+          fi
+          echo "caught, as expected"
