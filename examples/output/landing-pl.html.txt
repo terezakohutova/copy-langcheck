@@ -1,0 +1,7 @@
+$ python langcheck.py examples/landing-pl.html
+[hunspell] "nagrode" -> nagrodę, nagroda, nagrodo  (unknown word)  in: Zgarnij nagrode za polecenie
+[hunspell] "Sprawdz" -> Sprawdź, Sprawdza, Sprawdzi  (unknown word)  in: Sprawdz swoje wydatki w jednym miejscu i oszczędzaj bez wysiłku.
+[languagetool MORFOLOGIK_RULE_PL_PL] "nagrode" -> nagrodę, Nagrodę, nagrody  (Wykryto prawdopodobny błąd pisowni)  in: Zgarnij nagrode za polecenie
+[languagetool MORFOLOGIK_RULE_PL_PL] "Sprawdz" -> Sprawdź, Sprawdza, Sprawdzi  (Wykryto prawdopodobny błąd pisowni)  in: Sprawdz swoje wydatki w jednym miejscu i oszczędzaj bez wysiłku.
+4 texts checked in pl: 4 findings
+(exit 1)

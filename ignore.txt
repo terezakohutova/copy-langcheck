@@ -1,0 +1,2 @@
+# Words that are fine on purpose, one per line: brand, product and feature names.
+# Lines starting with # are ignored.
