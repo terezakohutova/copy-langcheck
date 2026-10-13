@@ -369,8 +369,9 @@ class DegradeTest(TempFiles):
         self.assertEqual(code, 3)
         self.assertIn('NOT CHECKED', out)
 
-    def test_findings_win_over_unchecked(self):
-        self.assertEqual(run(['--lang', 'en', 'Your mony'])[0], 1)
+    def test_unchecked_wins_over_findings_when_strict(self):
+        self.assertEqual(run(['--lang', 'en', 'Your mony'])[0], 3)            # since 1.3.0, findings still listed
+        self.assertEqual(run(['--lang', 'en', '--lenient', 'Your mony'])[0], 1)
 
     def test_one_failure_is_retried(self):
         def flaky(n, url, form):
@@ -391,10 +392,10 @@ class DegradeTest(TempFiles):
         opener = fake_urlopen(lt_matches={texts[0]: [lt_match(0, 4, repl=['You'])]}, script=dies_after_first)
         p = self.write('t.txt', '\n\n'.join(texts))
         code, rep, _ = run_json(['--lang', 'en', p], opener=opener)
-        self.assertEqual(code, 1)                                    # the finding before the failure is kept
+        self.assertEqual(code, 3)                                    # not fully checked, the finding is kept
         self.assertEqual([f['tool'] for f in rep['findings']], ['languagetool'])
-        sent = [form['text'] for _, form in opener.calls]
-        self.assertEqual(sent, [texts[0], texts[1], texts[1], texts[2], texts[2]])   # each retried once, none dropped
+        sent = sorted(form['text'] for _, form in opener.calls)     # sent concurrently, order varies
+        self.assertEqual(sent, sorted([texts[0], texts[1], texts[1], texts[2], texts[2]]))   # each retried once
         self.assertIn('2 of 3 texts not checked', rep['checked']['en-GB']['skipped']['languagetool'])
         self.assertEqual(rep['checked']['en-GB']['partly'], ['languagetool'])
 
@@ -406,7 +407,7 @@ class DegradeTest(TempFiles):
         p = self.write('t.txt', 'Your money\n\nGet a friend\n\nIn one place')
         code, out, _ = run(['--lang', 'en', p], opener=opener)
         self.assertEqual(code, 3)
-        self.assertEqual(len(opener.calls), 3)       # server gone: retried once, then not asked again
+        self.assertLessEqual(len(opener.calls), 5)   # server gone: retried once, only requests already in flight
         self.assertIn('languagetool (partly)', out)
 
     def test_http_error_is_reported(self):
@@ -589,7 +590,8 @@ class IgnoreTest(TempFiles):
 class InputTest(TempFiles):
     def test_markdown_strips_markup(self):
         md = '# Title\n\nSee [the app](https://x.y) and `code`.\n\n```\nskip me\n```\n\n- **Bold** item'
-        self.assertEqual(texts_of(langcheck.parse_text(md)), ['Title', 'See the app and .', 'Bold item'])
+        self.assertEqual(texts_of(langcheck.parse_text(md)),
+                         ['Title', f'See the app and {langcheck.PLACEHOLDER}.', 'Bold item'])
 
     def test_json_known_keys_and_lang(self):
         p = self.write('a.json', json.dumps({'lang': 'pl', 'headline': 'H', 'copy': ['A', 'B'], 'url': 'skip',
@@ -633,7 +635,8 @@ class ActionTest(unittest.TestCase):
 
     def test_strict_default_and_pinned_image(self):
         self.assertRegex(self.action, r"strict:\n(?:    .*\n)*?    default: 'true'")
-        self.assertRegex(self.action, r'erikvl87/languagetool:6\.8@sha256:[0-9a-f]{64}')
+        with open(os.path.join(ROOT, 'scripts', 'languagetool.sh'), encoding='utf-8') as f:
+            self.assertRegex(f.read(), r'erikvl87/languagetool:6\.8@sha256:[0-9a-f]{64}')
         self.assertIn('RUNNER_OS', self.action)
 
     def test_selftest_has_a_grammar_only_case(self):
@@ -716,7 +719,7 @@ class ExamplesTest(TempFiles):
     """The bundled examples with the real LibreOffice dictionaries, network layers off."""
 
     def hunspell_words(self, *argv):
-        code, rep, _ = run_json(['--no-languagetool', *argv], dicts=REAL_DICTS)
+        code, rep, _ = run_json(['--no-languagetool', '--no-suggest', *argv], dicts=REAL_DICTS)
         return code, [f['found'] for f in rep['findings']]
 
     def test_planted_mistakes_are_caught(self):

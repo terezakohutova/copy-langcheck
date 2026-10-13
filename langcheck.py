@@ -3,7 +3,7 @@
 Read-only: it never changes your text. Exit code 1 when anything is found, so it
 can gate a build, a commit or an ad upload.
 
-    python langcheck.py --lang cs "Pozvi kamaráda a získej odměnu"
+    python langcheck.py --lang cs --text "Pozvi kamaráda a získej odměnu"
     python langcheck.py --lang pl copy.txt              # plain text or Markdown, one check per paragraph
     python langcheck.py page.html ads.json              # several files; HTML/JSON can state their own language
     python langcheck.py --lang de-AT --all-strings app-strings.json   # every string value in the JSON
@@ -22,6 +22,7 @@ Layers, each reported when it cannot run:
 
 Exit codes: 0 clean, 1 findings, 2 bad input, 3 could not check (a layer that applies
 did not run on every text; with --lenient only when a text was checked by no layer).
+3 wins over 1: findings are still listed, but fixing them would not make the copy clean.
 """
 from __future__ import annotations
 
@@ -29,21 +30,25 @@ import argparse
 import bisect
 import dataclasses
 import difflib
+import html
 import html.parser
+import http.client
 import json
 import os
 import re
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-__version__ = '1.2.0'
+__version__ = '1.3.0'
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KOREKTOR_URL = 'https://lindat.mff.cuni.cz/services/korektor/api/correct'
@@ -53,6 +58,9 @@ KOREKTOR_BATCH_CHARS = 20000   # characters per Korektor request
 # headline without a full stop and the next text as one sentence and lowercases the next word.
 KOREKTOR_SEP = '\n\n'
 RETRY_DELAY = 1.0              # seconds before the one retry of a failed LanguageTool/Korektor request
+KOREKTOR_FALLBACK_MAX = 20     # per-text Korektor requests per run when a batch does not come back one to one
+LT_WORKERS = 4                 # LanguageTool requests in flight at once
+SUGGEST_LIMIT = 20             # unknown words per language that get Hunspell suggestions (about 1 to 4 s each)
 
 EXIT_CLEAN, EXIT_FINDINGS, EXIT_USAGE, EXIT_UNCHECKED = 0, 1, 2, 3
 
@@ -101,6 +109,11 @@ TEXT_KEYS = {'headline', 'headlines', 'title', 'subtitle', 'sub', 'subline', 'ct
              'body', 'primary_text', 'description', 'descriptions', 'long_headline', 'subject', 'preheader'}
 META_KEYS = {'lang', 'language', 'market'}   # JSON keys that describe the copy, never checked
 SKIP_TAGS = {'script', 'style', 'svg', 'math', 'template', 'noscript', 'code', 'pre', 'kbd', 'samp'}
+# Skipped elements that leave nothing behind. Other skipped inline elements (code, kbd, samp,
+# translate="no") become PLACEHOLDER, so the sentence around them still reads as a sentence.
+NO_PLACEHOLDER = {'script', 'style', 'svg', 'math', 'template', 'noscript'}
+PLACEHOLDER = 'X'   # read as a noun by LanguageTool, too short for a dictionary lookup
+FILL = '\x00'        # pads a placeholder to the length of what it replaced; dropped from the text
 # Only elements that end a run of text. Inline elements (a, span, b, em...) join their text
 # with the words around them, and <br> becomes a space. Form controls and <title> are
 # separate labels, so they count as blocks here.
@@ -108,7 +121,7 @@ BLOCK_TAGS = {
     'address', 'article', 'aside', 'blockquote', 'body', 'button', 'caption', 'dd', 'details', 'dialog',
     'div', 'dl', 'dt', 'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5',
     'h6', 'head', 'header', 'hgroup', 'hr', 'html', 'label', 'legend', 'li', 'main', 'nav', 'ol', 'optgroup',
-    'option', 'p', 'section', 'select', 'summary', 'table', 'tbody', 'td', 'textarea', 'tfoot', 'th',
+    'option', 'p', 'pre', 'section', 'select', 'summary', 'table', 'tbody', 'td', 'textarea', 'tfoot', 'th',
     'thead', 'title', 'tr', 'ul',
 }
 VOID_TAGS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source',
@@ -158,6 +171,7 @@ class LayerResult:
     findings: list[Finding] = field(default_factory=list)
     unchecked: list[str] = field(default_factory=list)   # texts this layer could not check
     error: str = ''
+    note: str = ''                                      # worth saying, but the check itself is complete
 
 
 def dicts_dir() -> str:
@@ -236,6 +250,25 @@ def collapse(s: str) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
 
+def _collapse_mapped(s: str, pos: list[int]) -> tuple[str, list[int]]:
+    """collapse() that keeps the source offset of every character it keeps."""
+    chars: list[str] = []
+    out: list[int] = []
+    gap = -1
+    for c, p in zip(s, pos, strict=True):
+        if c.isspace():
+            if chars and gap < 0:
+                gap = p
+            continue
+        if gap >= 0:
+            chars.append(' ')
+            out.append(gap)
+            gap = -1
+        chars.append(c)
+        out.append(p)
+    return ''.join(chars), out
+
+
 class _Lines:
     def __init__(self, raw: str) -> None:
         self.starts = [0] + [m.end() for m in re.finditer('\n', raw)]
@@ -255,57 +288,149 @@ class Snippet:
     source: str = ''
     lang: str = ''       # language as stated in the source, '' = not stated
     scope: str = ''      # 'file' = stated for the whole file, 'element' = for a part of it
-    line: int = 0        # start of `raw` in the source, 1-based; 0 = unknown
+    line: int = 0        # start of the text in the source, 1-based; 0 = unknown
     col: int = 0
-    raw: str = ''        # the stretch of the source the text was taken from
+    pos: list[int] = field(default_factory=list, repr=False)   # source offset of each character of `text`
+    lines: _Lines | None = field(default=None, repr=False, compare=False)
 
-    def locate(self, offset: int, found: str) -> tuple[int, int]:
-        """Line and column of `found` (at `offset` in text) in the source; falls back to the text start."""
-        if not self.raw:
+    def locate(self, offset: int, found: str = '') -> tuple[int, int]:
+        """Line and column in the source of the character at `offset` in the text."""
+        if not self.pos or self.lines is None:
             return self.line, self.col
-        pos = -1
-        words = found.split()
-        if words:
-            k = len(re.findall(re.escape(found), self.text[:offset]))
-            pattern = r'\s+'.join(map(re.escape, words))
-            hits = [m.start() for m in re.finditer(pattern, self.raw)]
-            if k < len(hits):
-                pos = hits[k]
-        if pos < 0:
-            pos = len(self.raw) - len(self.raw.lstrip())
-        prefix = self.raw[:pos]
-        nl = prefix.count('\n')
-        return self.line + nl, (self.col + pos) if nl == 0 else pos - prefix.rfind('\n')
+        return self.lines.linecol(self.pos[min(max(offset, 0), len(self.pos) - 1)])
 
 
-def _snippet(text: str, source: str, lang: tuple[str, str], raw: str, lines: _Lines,
-             start: int, end: int) -> Snippet:
-    piece = raw[start:end]
-    line, col = lines.linecol(start)
-    return Snippet(collapse(text), source, lang[0], lang[1], line, col, piece)
+def _mapped(text: str, pos: list[int], source: str, lang: tuple[str, str], lines: _Lines,
+            placeholders: Iterable[int] = ()) -> Snippet | None:
+    """A snippet from extracted text and its source offsets; None when nothing but skipped markup is left."""
+    if FILL in text:
+        kept = [(c, p) for c, p in zip(text, pos, strict=True) if c != FILL]
+        text, pos = ''.join(c for c, _ in kept), [p for _, p in kept]
+    text, pos = _collapse_mapped(text, pos)
+    if not text:
+        return None
+    ph = set(placeholders)
+    if ph and not any(c.isalnum() for c, p in zip(text, pos, strict=True) if p not in ph):
+        return None
+    line, col = lines.linecol(pos[0])
+    return Snippet(text, source, lang[0], lang[1], line, col, pos, lines)
+
+
+def _plain(raw: str, source: str) -> Snippet | None:
+    return _mapped(raw, list(range(len(raw))), source, ('', ''), _Lines(raw))
 
 
 def _blank(m: re.Match[str]) -> str:
     return re.sub(r'[^\n]', ' ', m.group())
 
 
+_FRONT_RE = re.compile(r'\A---[ \t]*\r?\n(.*?\n)?(?:---|\.\.\.)[ \t]*(?:\r?\n|\Z)', re.S)
+_FRONT_KEY_RE = re.compile(r'^(title|description)[ \t]*:[ \t]*(.*?)[ \t]*$', re.M)
+
+
+def _front_matter(raw: str) -> tuple[int, list[tuple[str, list[int]]]]:
+    """YAML front matter at the very start: (its length, [(title or description value, offsets)])."""
+    m = _FRONT_RE.match(raw)
+    if not m:
+        return 0, []
+    body_start, body = m.start(1), m.group(1) or ''
+    values = []
+    for k in _FRONT_KEY_RE.finditer(body):
+        v, start = k.group(2), body_start + k.start(2)
+        if v[:1] in ('>', '|'):                       # block scalar: the indented lines below it
+            chars: list[str] = []
+            pos: list[int] = []
+            i = body_start + k.end()
+            for ln in re.finditer(r'\n([ \t]+)(\S[^\n]*)', body[k.end():]):
+                if ln.start() and body[k.end():][ln.start() - 1] != '\n' and not chars:
+                    break
+                a, b = i + ln.start(2), i + ln.end(2)
+                chars.extend(' ' + raw[a:b])
+                pos.extend([a, *range(a, b)])
+            if chars:
+                values.append((''.join(chars), pos))
+            continue
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+            v, start = v[1:-1], start + 1
+        if v.strip():
+            values.append((v, list(range(start, start + len(v)))))
+    return m.end(), values
+
+
 def parse_text(raw: str, source: str = '') -> list[Snippet]:
-    """Plain text or Markdown: one text per paragraph, markup blanked out (positions are kept)."""
-    t = re.sub(r'```.*?```', _blank, raw, flags=re.S)                          # code blocks
-    t = re.sub(r'`[^`\n]*`|!\[[^\]\n]*\]\([^)\n]*\)|<[^>\n]+>', _blank, t)      # inline code, images, tags
+    """Plain text or Markdown: one text per paragraph. Markup is blanked out and inline code becomes
+    a placeholder, both keeping every position, so a finding points at its place in the source.
+    YAML front matter is skipped except its title and description."""
+    lines = _Lines(raw)
+    out: list[Snippet] = []
+    front, values = _front_matter(raw)
+    for v, pos in values:
+        s = _mapped(v, pos, source, ('', ''), lines)
+        if s:
+            out.append(s)
+    placeholders: list[int] = []
+
+    def code(m: re.Match[str]) -> str:
+        placeholders.append(m.start())
+        return PLACEHOLDER + FILL * (len(m.group()) - len(PLACEHOLDER))   # same length, no extra space
+
+    t = ' ' * front + raw[front:]
+    t = re.sub(r'```.*?```', _blank, t, flags=re.S)                             # code blocks
+    t = re.sub(r'<!--.*?-->', _blank, t, flags=re.S)                            # comments, also multi-line
+    t = re.sub(r'`[^`\n]+`', code, t)                                           # inline code -> placeholder
+    t = re.sub(r'!\[[^\]\n]*\]\([^)\n]*\)|<[^>\n]+>', _blank, t)                # images, tags
     t = re.sub(r'\[([^\]\n]*)\]\([^)\n]*\)',                                   # links -> their text
                lambda m: ' ' + m.group(1) + ' ' * (len(m.group()) - len(m.group(1)) - 1), t)
     t = re.sub(r'^([ \t]{0,3})(#{1,6}[ \t]+|[-*+][ \t]+|\d+\.[ \t]+|>[ \t]?)',
                lambda m: m.group(1) + ' ' * len(m.group(2)), t, flags=re.M)
     t = t.replace('**', '  ').replace('__', '  ')
-    lines = _Lines(raw)
-    out = []
     for m in re.finditer(r'(?:^[^\S\n]*\S[^\n]*(?:\n|\Z))+', t, flags=re.M):
-        text = collapse(m.group())
-        if text:
-            start = m.start() + len(m.group()) - len(m.group().lstrip())
-            out.append(_snippet(text, source, ('', ''), raw, lines, start, m.end()))
+        s = _mapped(m.group(), list(range(m.start(), m.end())), source, ('', ''), lines, placeholders)
+        if s:
+            out.append(s)
     return out
+
+
+_REF_RE = re.compile(r'&(?:#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[A-Za-z][A-Za-z0-9]*;?)')
+
+
+def _decode(raw: str, start: int, end: int, want: str) -> list[int]:
+    """Offsets in raw[start:end] of each character of `want`, the same stretch with character
+    references decoded. When the two do not line up, offsets count from `start`."""
+    chars: list[str] = []
+    pos: list[int] = []
+    i = start
+    while i < end and len(chars) < len(want):
+        m = _REF_RE.match(raw, i, end) if raw[i] == '&' else None
+        d = html.unescape(m.group()) if m else ''
+        if m and d != m.group():
+            chars.extend(d)
+            pos.extend([i] * len(d))
+            i = m.end()
+        else:
+            chars.append(raw[i])
+            pos.append(i)
+            i += 1
+    if ''.join(chars)[:len(want)] != want:
+        return [min(start + k, max(end - 1, start)) for k in range(len(want))]
+    return pos[:len(want)]
+
+
+_ATTR_RE = re.compile(r'''([^\s/>"'=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?''')
+
+
+def _attr_spans(tag_text: str) -> dict[str, tuple[int, int]]:
+    """Where each attribute value sits inside the raw start tag (the last one wins, as in HTMLParser)."""
+    spans = {}
+    name = re.match(r'<[^\s/>]+', tag_text)
+    for m in _ATTR_RE.finditer(tag_text, name.end() if name else 0):
+        for g in (2, 3, 4):
+            if m.group(g) is not None:
+                spans[m.group(1).lower()] = m.span(g)
+                break
+        else:
+            spans[m.group(1).lower()] = (m.end(), m.end())
+    return spans
 
 
 class _HTML(html.parser.HTMLParser):
@@ -313,10 +438,11 @@ class _HTML(html.parser.HTMLParser):
         super().__init__(convert_charrefs=True)
         self.raw, self.source, self.lines = raw, source, _Lines(raw)
         self.out: list[Snippet] = []
-        self.buf: list[str] = []
-        self.buf_start = 0
+        self.chars: list[str] = []
+        self.pos: list[int] = []
+        self.ph: list[int] = []
         self.buf_lang: tuple[str, str] = ('', '')
-        self.stack: list[tuple[str, str, str]] = []   # (tag, lang, scope)
+        self.stack: list[tuple[str, str, str, bool, bool]] = []   # (tag, lang, scope, skipped, inside SKIP_TAGS)
 
     def _here(self) -> int:
         line, col0 = self.getpos()
@@ -326,65 +452,159 @@ class _HTML(html.parser.HTMLParser):
         return (self.stack[-1][1], self.stack[-1][2]) if self.stack else ('', '')
 
     def _skipping(self) -> bool:
-        return any(t in SKIP_TAGS for t, _, _ in self.stack)
+        return bool(self.stack) and self.stack[-1][3]
 
-    def flush(self, end: int | None = None) -> None:
-        text = collapse(''.join(self.buf))
-        if text:
-            end = self._here() if end is None else end
-            self.out.append(_snippet(text, self.source, self.buf_lang, self.raw, self.lines, self.buf_start, end))
-        self.buf = []
+    def _add(self, text: str, pos: list[int], lang: tuple[str, str]) -> None:
+        if self.chars and lang != self.buf_lang and text.strip():
+            self.flush()                      # a part in another language is its own text
+        if not self.chars:
+            if not text.strip():
+                return
+            self.buf_lang = lang
+        self.chars.extend(text)
+        self.pos.extend(pos)
+
+    def flush(self) -> None:
+        s = _mapped(''.join(self.chars), self.pos, self.source, self.buf_lang, self.lines, self.ph)
+        if s:
+            self.out.append(s)
+        self.chars, self.pos, self.ph = [], [], []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         a = {k: (v or '') for k, v in attrs}
         own = a.get('lang', a.get('xml:lang'))
-        lang = self._lang() if own is None else (own.strip(), 'file' if tag == 'html' else 'element')
+        parent_lang = self._lang()
+        lang = parent_lang if own is None else (own.strip(), 'file' if tag == 'html' else 'element')
+        parent_skip = self._skipping()
+        hard = tag in SKIP_TAGS or (bool(self.stack) and self.stack[-1][4])
+        translate = (a.get('translate') or '').strip().lower() if 'translate' in a else None
+        if hard:
+            skip = True
+        elif translate in ('no', 'yes', ''):
+            skip = translate == 'no'                  # translate="yes" inside "no" is copy again
+        else:
+            skip = parent_skip or 'notranslate' in a.get('class', '').split()
         if tag in BLOCK_TAGS:
             self.flush()
-        if tag == 'br' and self.buf:
-            self.buf.append(' ')
-        if tag not in VOID_TAGS:
-            self.stack.append((tag, *lang))
-        if self._skipping():
-            return
-        texts = [a[k] for k in TEXT_ATTRS if a.get(k, '').strip()]
-        if tag == 'meta' and (a.get('name', '').lower() in META_TEXT or a.get('property', '').lower() in META_TEXT):
-            texts.append(a.get('content', ''))
         start = self._here()
-        end = start + len(self.get_starttag_text() or '')
-        for v in texts:
-            if v.strip():
-                self.out.append(_snippet(v, self.source, lang, self.raw, self.lines, start, end))
+        if tag == 'br' and self.chars and not parent_skip:
+            self._add(' ', [start], self.buf_lang)
+        if skip and not parent_skip and tag not in VOID_TAGS | BLOCK_TAGS | NO_PLACEHOLDER:
+            self._add(PLACEHOLDER, [start] * len(PLACEHOLDER), parent_lang)   # inline code, a name: keep the sentence
+            self.ph.append(start)
+        if tag not in VOID_TAGS:
+            self.stack.append((tag, *lang, skip, hard))
+        if skip:
+            return
+        names = [k for k in TEXT_ATTRS if a.get(k, '').strip()]
+        if tag == 'meta' and (a.get('name', '').lower() in META_TEXT or a.get('property', '').lower() in META_TEXT):
+            names.append('content')
+        if not names:
+            return
+        spans = _attr_spans(self.get_starttag_text() or '')
+        for k in names:
+            v = a.get(k, '')
+            if not v.strip():
+                continue
+            b, e = spans.get(k, (0, 0))
+            s = _mapped(v, _decode(self.raw, start + b, start + e, v), self.source, lang, self.lines)
+            if s:
+                self.out.append(s)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in VOID_TAGS:
             return
         if tag in BLOCK_TAGS:
             self.flush()
-        if any(t == tag for t, _, _ in self.stack):
+        if any(t[0] == tag for t in self.stack):
             while self.stack and self.stack.pop()[0] != tag:
                 pass
 
     def handle_data(self, data: str) -> None:
         if self._skipping():
             return
-        lang = self._lang()
-        if self.buf and lang != self.buf_lang and data.strip():
-            self.flush()                      # a part in another language is its own text
-        if not self.buf:
-            if not data.strip():
-                return
-            self.buf_start = self._here() + len(data) - len(data.lstrip())
-            self.buf_lang = lang
-        self.buf.append(data)
+        start = self._here()
+        self._add(data, _decode(self.raw, start, len(self.raw), data), self._lang())
 
 
 def parse_html(raw: str, source: str = '') -> list[Snippet]:
     p = _HTML(raw, source)
     p.feed(raw)
     p.close()
-    p.flush(end=len(raw))
+    p.flush()
     return p.out
+
+
+_JSON_ESC = {'n': '\n', 't': '\t', 'r': '\r', 'b': '\b', 'f': '\f'}
+_JSON_SCALAR = re.compile(r'[^\s,\]}]+')
+
+
+def json_string_offsets(raw: str) -> dict[tuple[Any, ...], tuple[str, list[int]]]:
+    """Every string value in a valid JSON document: path (keys and list indices) -> (value, the
+    source offset of each of its characters). A repeated key keeps the last value, as json.loads does."""
+    out: dict[tuple[Any, ...], tuple[str, list[int]]] = {}
+    n = len(raw)
+
+    def ws(i: int) -> int:
+        while i < n and raw[i] in ' \t\r\n':
+            i += 1
+        return i
+
+    def string(i: int) -> tuple[str, list[int], int]:
+        chars: list[str] = []
+        pos: list[int] = []
+        i += 1
+        while raw[i] != '"':
+            if raw[i] != '\\':
+                chars.append(raw[i])
+                pos.append(i)
+                i += 1
+                continue
+            e = raw[i + 1]
+            if e != 'u':
+                chars.append(_JSON_ESC.get(e, e))
+                pos.append(i)
+                i += 2
+                continue
+            code, j = int(raw[i + 2:i + 6], 16), i + 6
+            if 0xD800 <= code < 0xDC00 and raw[j:j + 2] == '\\u':
+                low = int(raw[j + 2:j + 6], 16)
+                if 0xDC00 <= low < 0xE000:
+                    code, j = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00), j + 6
+            chars.append(chr(code))
+            pos.append(i)
+            i = j
+        return ''.join(chars), pos, i + 1
+
+    def value(i: int, path: tuple[Any, ...]) -> int:
+        i = ws(i)
+        c = raw[i]
+        if c in '{[':
+            close, k = ('}' if c == '{' else ']'), 0
+            i = ws(i + 1)
+            if raw[i] == close:
+                return i + 1
+            while True:
+                if c == '{':
+                    key, _, i = string(ws(i))
+                    i = value(ws(i) + 1, (*path, key))         # + 1 skips the colon
+                else:
+                    i = value(i, (*path, k))
+                    k += 1
+                i = ws(i)
+                if raw[i] == ',':
+                    i = ws(i + 1)
+                    continue
+                return i + 1
+        if c == '"':
+            v, pos, i = string(i)
+            out[path] = (v, pos)
+            return i
+        m = _JSON_SCALAR.match(raw, i)
+        return m.end() if m else i + 1
+
+    value(0, ())
+    return out
 
 
 def parse_json(raw: str, source: str = '', all_strings: bool = False) -> list[Snippet]:
@@ -393,31 +613,25 @@ def parse_json(raw: str, source: str = '', all_strings: bool = False) -> list[Sn
     except json.JSONDecodeError as e:
         raise UsageError(f'{source}: not valid JSON ({e})') from None
     lines = _Lines(raw)
+    offsets = json_string_offsets(raw)
     out: list[Snippet] = []
-    cursor = 0
 
-    def walk(x: Any, key: str, lang: tuple[str, str], depth: int) -> None:
-        nonlocal cursor
+    def walk(x: Any, key: str, path: tuple[Any, ...], lang: tuple[str, str], depth: int) -> None:
         if isinstance(x, dict):
             own = x.get('lang', x.get('language'))
             if isinstance(own, str) and own.strip():
                 lang = (own.strip(), 'file' if depth == 0 else 'element')
             for k, v in x.items():
                 if k not in META_KEYS:
-                    walk(v, k, lang, depth + 1)
+                    walk(v, k, (*path, k), lang, depth + 1)
         elif isinstance(x, list):
-            for v in x:
-                walk(v, key, lang, depth + 1)
+            for i, v in enumerate(x):
+                walk(v, key, (*path, i), lang, depth + 1)
         elif isinstance(x, str) and (all_strings or key in TEXT_KEYS) and x.strip():
-            for lit in dict.fromkeys((json.dumps(x, ensure_ascii=False), json.dumps(x))):
-                m = re.compile(r'[:\[,]\s*' + re.escape(lit)).search(raw, cursor)
-                if m:
-                    start = m.end() - len(lit)
-                    cursor = m.end()
-                    out.append(_snippet(x, source, lang, raw, lines, start + 1, m.end() - 1))
-                    return
-            out.append(Snippet(collapse(x), source, lang[0], lang[1]))
-    walk(data, '', ('', ''), 0)
+            v, pos = offsets.get(path, ('', []))
+            s = _mapped(x, pos, source, lang, lines) if v == x else None
+            out.append(s or Snippet(collapse(x), source, lang[0], lang[1]))
+    walk(data, '', (), ('', ''), 0)
     return out
 
 
@@ -434,7 +648,10 @@ def collect(path: str, all_strings: bool = False) -> list[Snippet]:
 
 
 def looks_like_path(arg: str) -> bool:
-    return not re.search(r'\s', arg) and arg.lower().endswith(FILE_EXTS)
+    """No spaces, and a path separator or something like a file extension, known or not."""
+    if not arg or re.search(r'\s', arg):
+        return False
+    return '/' in arg or '\\' in arg or bool(re.search(r'\.(?=[0-9]*[^\W\d_])\w{1,10}$', arg))
 
 
 # ---------------------------------------------------------------- layers
@@ -470,7 +687,10 @@ def words(text: str) -> Iterator[tuple[str, int]]:
                 yield p.group(), m.start() + p.start()
 
 
-def hunspell(texts: list[str], tag: str, ignored: Ignored) -> LayerResult:
+_SUGGEST_CACHE: dict[tuple[str, str, str], list[str]] = {}
+
+
+def hunspell(texts: list[str], tag: str, ignored: Ignored, suggest_limit: int = SUGGEST_LIMIT) -> LayerResult:
     d, why = load_dictionary(tag)
     if d is None:
         return LayerResult(unchecked=list(texts), error=why)
@@ -483,20 +703,34 @@ def hunspell(texts: list[str], tag: str, ignored: Ignored) -> LayerResult:
             forms.append(w.lower())
         return any(d.lookup(x) for x in forms)
 
+    def suggest(w: str) -> list[str]:
+        key = (dicts_dir(), tag, w)
+        if key in _SUGGEST_CACHE:
+            return _SUGGEST_CACHE[key]
+        if len(asked) >= suggest_limit:
+            without.add(w)
+            return []
+        asked.add(w)
+        try:
+            _SUGGEST_CACHE[key] = list(d.suggest(w))[:3]
+        except Exception:  # spylls can fail on odd affix data; the finding still stands
+            _SUGGEST_CACHE[key] = []
+        return _SUGGEST_CACHE[key]
+
     res = LayerResult()
-    suggestions: dict[str, list[str]] = {}
+    asked: set[str] = set()
+    without: set[str] = set()
     for t in texts:
         for w, off in words(t):
             if ignored(w) or known(w):
                 continue
-            if re.search(r"['’]", w) and all(known(p) or ignored(p) for p in re.split(r"['’]", w) if len(p) > 1):
+            if re.search(r"['’]", w) and all(known(p) or ignored(p) for p in re.split(r"['’]", w)
+                                                  if len(p) > 1):
                 continue
-            if w not in suggestions:
-                try:
-                    suggestions[w] = list(d.suggest(w))[:3]
-                except Exception:  # spylls can fail on odd affix data; the finding still stands
-                    suggestions[w] = []
-            res.findings.append(Finding('hunspell', w, suggestions[w], 'unknown word', t, offset=off))
+            res.findings.append(Finding('hunspell', w, suggest(w), 'unknown word', t, offset=off))
+    if without and suggest_limit > 0:
+        res.note = (f'suggestions for the first {suggest_limit} unknown words only, {len(without)} more listed '
+                    f'without (each takes seconds; --suggest-limit N to change, --no-suggest for none)')
     return res
 
 
@@ -518,32 +752,56 @@ def _post(url: str, form: dict[str, str], timeout: int = 60) -> Any:
         return json.load(r)
 
 
+def _retryable(e: Exception) -> bool:
+    """Worth one more try: the network, a timeout or a server error. Not a 4xx or a bad answer."""
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code >= 500
+    return isinstance(e, (OSError, http.client.HTTPException))
+
+
 def _with_retry(fn: Callable[[], Any]) -> Any:
     try:
         return fn()
-    except Exception:
+    except Exception as e:
+        if not _retryable(e):
+            raise
         time.sleep(RETRY_DELAY)
         return fn()
 
 
 def languagetool(texts: list[str], tag: str, ignored: Ignored, disabled: Iterable[str] = ()) -> LayerResult:
+    """Up to LT_WORKERS requests at once. Every failure is counted; when the server is gone,
+    texts not sent yet are not sent at all."""
     code = LANGS[tag][1]
     off_rules = list(dict.fromkeys([*LT_DISABLED, *disabled]))
     off = set(off_rules)
-    res = LayerResult()
-    down = ''
-    for t in texts:
-        if down:
-            res.unchecked.append(t)
-            continue
+    down = threading.Event()
+    down_why: list[str] = []
+
+    def one(t: str) -> tuple[list[dict[str, Any]] | None, str]:
+        if down.is_set():
+            return None, ''
         form = {'text': t, 'language': code, 'level': 'picky', 'disabledRules': ','.join(off_rules)}
         try:
-            matches = _with_retry(lambda f=form: _post(lt_url(), f)['matches'])
+            return _with_retry(lambda: _post(lt_url(), form)['matches']), ''
         except Exception as e:
-            res.unchecked.append(t)
-            res.error = f'{lt_url()}: {_http_error(e)}, grammar NOT checked'
+            why = _http_error(e)
             if _server_down(e):
-                down = res.error      # no point asking again for every remaining text
+                down_why.append(why)
+                down.set()            # no point asking again for every remaining text
+            return None, why
+
+    res = LayerResult()
+    if not texts:
+        return res
+    with ThreadPoolExecutor(max_workers=min(LT_WORKERS, len(texts))) as pool:
+        results = list(pool.map(one, texts))
+    errors: dict[str, int] = {}
+    for t, (matches, why) in zip(texts, results, strict=True):
+        if matches is None:
+            res.unchecked.append(t)
+            why = why or down_why[0]
+            errors[why] = errors.get(why, 0) + 1
             continue
         for m in matches:
             if m['rule']['id'] in off:
@@ -553,6 +811,9 @@ def languagetool(texts: list[str], tag: str, ignored: Ignored, disabled: Iterabl
                 continue
             res.findings.append(Finding('languagetool', bad, [x['value'] for x in m['replacements'][:3]],
                                         m['message'], t, rule=m['rule']['id'], offset=m['offset']))
+    if errors:
+        agg = '; '.join(f'{why} ({n} text{"s" if n > 1 else ""})' for why, n in errors.items())
+        res.error = f'{lt_url()}: {agg}, grammar NOT checked'
     return res
 
 
@@ -620,26 +881,41 @@ def _batches(texts: list[str], limit: int) -> Iterator[list[str]]:
 
 def korektor(texts: list[str], ignored: Ignored) -> LayerResult:
     res = LayerResult()
+    errors: list[str] = []
 
     def ask(text: str) -> str:
         return str(_with_retry(lambda: _post(KOREKTOR_URL, {'model': KOREKTOR_MODEL, 'data': text})['result']))
 
     down = False
+    budget = KOREKTOR_FALLBACK_MAX
     for batch in _batches(texts, KOREKTOR_BATCH_CHARS):
         if down:
             res.unchecked += batch
             continue
         try:
-            fixed = [x.strip() for x in ask(KOREKTOR_SEP.join(batch)).strip('\n').split(KOREKTOR_SEP)]
-            if len(fixed) != len(batch):        # texts did not come back one to one: ask per text
-                fixed = [ask(t).strip() for t in batch]
+            fixed: list[str | None] = [x.strip() for x in ask(KOREKTOR_SEP.join(batch)).strip('\n').split(KOREKTOR_SEP)]
+            if len(fixed) != len(batch):        # texts did not come back one to one: ask per text, up to a cap
+                fixed = []
+                for t in batch:
+                    if budget <= 0:
+                        fixed.append(None)
+                        continue
+                    budget -= 1
+                    fixed.append(ask(t).strip())
         except Exception as e:
             res.unchecked += batch
-            res.error = f'{_http_error(e)}, Czech checked by dictionary only'
+            errors.append(f'{_http_error(e)}, Czech checked by dictionary only')
             down = _server_down(e)
             continue
         for t, f in zip(batch, fixed, strict=True):
-            res.findings += korektor_diff(t, f, ignored)
+            if f is None:
+                res.unchecked.append(t)
+            else:
+                res.findings += korektor_diff(t, f, ignored)
+        if None in fixed:
+            errors.append(f'batches did not come back one to one and the per-text fallback is capped at '
+                          f'{KOREKTOR_FALLBACK_MAX} requests, the rest checked by dictionary only')
+    res.error = '; '.join(dict.fromkeys(errors))
     return res
 
 
@@ -655,9 +931,10 @@ class Report:
     exit_code: int = EXIT_CLEAN
 
 
-def _run_layer(name: str, texts: list[str], tag: str, ignored: Ignored, disabled: Iterable[str]) -> LayerResult:
+def _run_layer(name: str, texts: list[str], tag: str, ignored: Ignored, disabled: Iterable[str],
+               suggest_limit: int = SUGGEST_LIMIT) -> LayerResult:
     if name == 'hunspell':
-        return hunspell(texts, tag, ignored)
+        return hunspell(texts, tag, ignored, suggest_limit)
     if name == 'languagetool':
         return languagetool(texts, tag, ignored, disabled)
     return korektor(texts, ignored)
@@ -681,7 +958,7 @@ def merge_same_span(findings: list[Finding]) -> list[Finding]:
 
 def check(groups: dict[str, list[Snippet]], ignored: Ignored, *, online: bool = False, use_lt: bool = True,
           strict: bool = True, disabled_rules: Iterable[str] = (),
-          unsupported: dict[str, list[Snippet]] | None = None) -> Report:
+          unsupported: dict[str, list[Snippet]] | None = None, suggest_limit: int = SUGGEST_LIMIT) -> Report:
     """groups: language tag -> snippets. Runs every layer that applies and sets the exit code."""
     rep = Report(strict=strict)
     incomplete = False
@@ -701,7 +978,9 @@ def check(groups: dict[str, list[Snippet]], ignored: Ignored, *, online: bool = 
         skipped: dict[str, str] = {}
         found: list[Finding] = []
         for name in layers:
-            r = _run_layer(name, texts, tag, ignored, disabled_rules)
+            r = _run_layer(name, texts, tag, ignored, disabled_rules, suggest_limit)
+            if r.note:
+                rep.notes.append(f'[{name}] {tag}: {r.note}')
             missed = set(r.unchecked)
             for t in texts:
                 covered[t] += t not in missed
@@ -736,10 +1015,11 @@ def check(groups: dict[str, list[Snippet]], ignored: Ignored, *, online: bool = 
                          f'(first at {_where(s.source, s.line, s.col)})')
         incomplete = incomplete or strict
     rep.findings.sort(key=lambda f: (order.get(f.source, 0), f.line, f.col))
-    if rep.findings:
-        rep.exit_code = EXIT_FINDINGS
-    elif incomplete:
+    # Not fully checked wins over findings: fixing what was found would not make the copy clean.
+    if incomplete:
         rep.exit_code = EXIT_UNCHECKED
+    elif rep.findings:
+        rep.exit_code = EXIT_FINDINGS
     return rep
 
 
@@ -747,10 +1027,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog='langcheck.py',
         description='Spelling and grammar gate for marketing copy (cs, sk, pl, de, en).',
-        epilog='Exit codes: 0 clean, 1 findings, 2 bad input, 3 could not check. '
-               'Environment: LANGTOOLS_DICTS (dictionary folder), LT_URL (LanguageTool server).')
-    p.add_argument('inputs', nargs='+', metavar='FILE_OR_TEXT',
-                   help='files (.txt .md .html .json), "-" for stdin, or the copy itself in quotes')
+        epilog='Exit codes: 0 clean, 1 findings, 2 bad input, 3 could not check fully (findings, if any, '
+               'are still listed). Environment: LANGTOOLS_DICTS (dictionary folder), LT_URL (LanguageTool server).')
+    p.add_argument('inputs', nargs='*', metavar='FILE',
+                   help='files (.txt .md .html .json, anything else is read as text/Markdown) or "-" for stdin')
+    p.add_argument('--text', action='append', default=[], metavar='COPY',
+                   help='the copy itself (repeatable); a quoted positional argument still works but is deprecated')
     p.add_argument('--lang', help=f'language for texts that do not state their own: {SUPPORTED_TEXT}')
     p.add_argument('--force-lang', metavar='LANG',
                    help='use this language for everything, even where a file states another')
@@ -770,6 +1052,10 @@ def build_parser() -> argparse.ArgumentParser:
                       help='exit 3 when any applicable layer did not check every text (the default)')
     mode.add_argument('--lenient', action='store_true',
                       help='exit 3 only when a text was checked by no layer at all')
+    p.add_argument('--suggest-limit', type=int, default=SUGGEST_LIMIT, metavar='N',
+                   help=f'Hunspell suggestions only for the first N unknown words per language (default '
+                        f'{SUGGEST_LIMIT}); each takes seconds in pure Python')
+    p.add_argument('--no-suggest', action='store_true', help='no Hunspell suggestions at all (fastest)')
     p.add_argument('--json', action='store_true', help='machine-readable output')
     p.add_argument('--json-out', metavar='FILE', help='also write the machine-readable report to FILE')
     p.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
@@ -780,25 +1066,36 @@ def _where(source: str, line: int, col: int) -> str:
     return f'{source}:{line}:{col}' if line else source
 
 
-def gather(inputs: list[str], lang_arg: str = '', force_lang: str = '',
-           all_strings: bool = False) -> tuple[dict[str, list[Snippet]], dict[str, list[Snippet]]]:
+def is_legacy_text(arg: str) -> bool:
+    """A positional argument that is copy, not a file (deprecated: use --text)."""
+    return arg != '-' and not os.path.isfile(arg) and not looks_like_path(arg)
+
+
+def gather(inputs: list[str], lang_arg: str = '', force_lang: str = '', all_strings: bool = False,
+           texts: Iterable[str] = ()) -> tuple[dict[str, list[Snippet]], dict[str, list[Snippet]]]:
     """Return (language tag -> snippets, unsupported element-level language -> snippets)."""
     groups: dict[str, list[Snippet]] = {}
     unsupported: dict[str, list[Snippet]] = {}
     n_args = 0
-    for arg in inputs:
-        if arg == '-':
+    items = [(a, False) for a in inputs] + [(t, True) for t in texts]
+    n_text = 0
+    for arg, is_text in items:
+        if is_text:
+            n_text += 1
+            src = f'<text{n_text}>'
+            snippets = [s for s in [_plain(arg, src)] if s]
+        elif arg == '-':
             src = '<stdin>'
             snippets = parse_text(sys.stdin.read(), src)
         elif os.path.isfile(arg):
             src = arg
             snippets = collect(arg, all_strings)
         elif looks_like_path(arg):
-            raise UsageError(f'file not found: {arg}')
+            raise UsageError(f'file not found: {arg} (copy that looks like a path goes in with --text)')
         else:
             n_args += 1
             src = f'<arg{n_args}>'
-            snippets = [Snippet(collapse(arg), src, line=1, col=1, raw=arg)] if arg.strip() else []
+            snippets = [s for s in [_plain(arg, src)] if s]
         if not snippets:
             hint = ' (JSON: only copy keys are read, see --all-strings)' if src.lower().endswith('.json') else ''
             raise UsageError(f'{src}: no text found{hint}')
@@ -831,14 +1128,14 @@ def render(rep: Report) -> str:
     for tag, c in rep.checked.items():
         layers = ', '.join(c['ran'] + [f'{x} (partly)' for x in c['partly']]) or 'nothing'
         lines.append(f"{c['texts']} texts checked in {tag} by {layers}")
-    if rep.exit_code == EXIT_FINDINGS:
+    if rep.findings:
         lines.append(f'{len(rep.findings)} findings')
-    elif rep.exit_code == EXIT_UNCHECKED:
+    if rep.exit_code == EXIT_UNCHECKED:
         missing = [f"{tag} ({', '.join(c['skipped'])})" for tag, c in rep.checked.items() if c['skipped']]
         missing += [f'lang="{lang}" (not supported)' for lang in rep.unsupported]
         hint = '' if not rep.strict else '; --lenient accepts this when every text was checked by at least one layer'
         lines.append('NOT CHECKED, did not run: ' + '; '.join(missing) + hint)
-    else:
+    elif not rep.findings:
         lines.append('clean')
     return '\n'.join(lines)
 
@@ -859,10 +1156,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_online:
         print('langcheck: --no-online is deprecated (Korektor is off unless --online) and will be removed in 2.0',
               file=sys.stderr)
+    if not args.inputs and not args.text:
+        print('langcheck: nothing to check; give files, "-" for stdin or --text "copy"', file=sys.stderr)
+        return EXIT_USAGE
+    if any(is_legacy_text(a) for a in args.inputs):
+        print('langcheck: copy as a positional argument is deprecated and will be removed in 2.0; '
+              'use --text "copy" (anything that looks like a path is now read as a file)', file=sys.stderr)
     try:
         lang_arg = norm_lang(args.lang) if args.lang else ''
         force = norm_lang(args.force_lang) if args.force_lang else ''
-        groups, unsupported = gather(args.inputs, lang_arg, force, args.all_strings)
+        groups, unsupported = gather(args.inputs, lang_arg, force, args.all_strings, args.text)
         default_ignore = os.path.join(HERE, 'ignore.txt')
         ignored = make_ignored(([default_ignore] if os.path.exists(default_ignore) else []) + args.ignore)
     except (UsageError, OSError, UnicodeDecodeError) as e:
@@ -870,7 +1173,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
     disabled = ignored.rules + [r.strip() for x in args.disable_rule for r in x.split(',') if r.strip()]
     rep = check(groups, ignored, online=args.online and not args.no_online, use_lt=not args.no_languagetool,
-                strict=not args.lenient, disabled_rules=disabled, unsupported=unsupported)
+                strict=not args.lenient, disabled_rules=disabled, unsupported=unsupported,
+                suggest_limit=0 if args.no_suggest else max(args.suggest_limit, 0))
     if args.json_out:
         with open(args.json_out, 'w', encoding='utf-8') as f:
             f.write(report_json(rep) + '\n')

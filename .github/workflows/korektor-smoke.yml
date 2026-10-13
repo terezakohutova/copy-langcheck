@@ -1,0 +1,31 @@
+# Opt-in check against the real public Korektor API (LINDAT). Manual only: it sends the
+# bundled example copy, which is public anyway, to a third party, and the service is
+# outside this repository's control, so it must not decide whether a push is green.
+name: korektor-smoke
+on:
+  workflow_dispatch:
+
+jobs:
+  korektor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - run: python fetch_dicts.py cs
+      - name: Korektor must run and flag the planted Czech mistakes
+        run: |
+          code=0
+          python langcheck.py --online --no-suggest --json-out report.json examples/ad-copy.json || code=$?
+          test "$code" = 1 || { echo "::error::expected exit code 1, got $code"; exit 1; }
+          python3 - <<'PY'
+          import json
+          rep = json.load(open('report.json', encoding='utf-8'))
+          ran = rep['checked']['cs-CZ']['ran']
+          tools = {t for f in rep['findings'] for t in [f['tool'], *f['also']]}
+          print('ran:', ran, 'tools:', tools)
+          assert 'korektor' in ran, ran
+          assert 'korektor' in tools, tools
+          PY

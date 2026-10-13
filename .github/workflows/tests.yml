@@ -30,9 +30,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install -r requirements.txt
+      # The dictionaries depend only on fetch_dicts.py, which pins the LibreOffice commit (REF).
+      - id: ref
+        shell: bash
+        run: echo "ref=$(grep -m1 '^REF = ' fetch_dicts.py | grep -oE '[0-9a-f]{40}')" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v5
         with:
           path: dicts
-          key: dicts-${{ hashFiles('fetch_dicts.py', 'langcheck.py') }}
+          key: dicts-${{ steps.ref.outputs.ref }}-${{ hashFiles('fetch_dicts.py') }}
       - run: python fetch_dicts.py
       - run: python -m unittest -v

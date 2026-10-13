@@ -83,9 +83,11 @@ runs:
     - name: Dictionary cache key
       id: dicts
       shell: bash
+      # The dictionaries depend only on fetch_dicts.py and the LibreOffice commit pinned in it.
       run: |
+        ref=$(grep -m1 '^REF = ' "$GITHUB_ACTION_PATH/fetch_dicts.py" | grep -oE '[0-9a-f]{40}')
         echo "dir=$RUNNER_TEMP/copy-langcheck-dicts" >> "$GITHUB_OUTPUT"
-        echo "key=copy-langcheck-dicts-$(cat "$GITHUB_ACTION_PATH/fetch_dicts.py" "$GITHUB_ACTION_PATH/langcheck.py" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        echo "key=copy-langcheck-dicts-${ref:0:12}-$(sha256sum "$GITHUB_ACTION_PATH/fetch_dicts.py" | cut -c1-16)" >> "$GITHUB_OUTPUT"
     - uses: actions/cache@v5
       with:
         path: ${{ steps.dicts.outputs.dir }}
@@ -96,33 +98,13 @@ runs:
         LANGTOOLS_DICTS: ${{ steps.dicts.outputs.dir }}
         PYTHONPATH: ${{ steps.deps.outputs.lib }}
       run: '"${{ steps.deps.outputs.python }}" "$GITHUB_ACTION_PATH/fetch_dicts.py"'
-    - name: Start LanguageTool
-      if: inputs.languagetool == 'true' && inputs.lt-url == ''
-      shell: bash
-      env:
-        INPUT_STRICT: ${{ inputs.strict }}
-      run: |
-        if [ "$RUNNER_OS" != "Linux" ]; then
-          msg="The LanguageTool container needs a Linux runner, this one is $RUNNER_OS. Use runs-on: ubuntu-latest, point lt-url at a server you run, or set languagetool: false."
-          if [ "$INPUT_STRICT" = "true" ]; then echo "::error::$msg"; exit 1; fi
-          echo "::warning::$msg Continuing because strict is false: grammar will not be checked."
-          exit 0
-        fi
-        # erikvl87/languagetool:6.8, pinned to the multi-arch index digest it had on 2026-10-13.
-        docker run -d --name languagetool -p 8081:8010 \
-          erikvl87/languagetool:6.8@sha256:ef8fa12cbd485166c9ceeb7139d76d56d07707a624da6bb1fc1fbb5411750527 >/dev/null
-        for i in $(seq 1 60); do
-          curl -sf "http://localhost:8081/v2/check?language=en-GB&text=Test." >/dev/null && { echo "LanguageTool up after $((i * 2)) s"; exit 0; }
-          sleep 2
-        done
-        echo "::warning::LanguageTool did not start; the check will report grammar as not checked (exit code 3 when strict)"
     - name: Check the copy
       id: check
       shell: bash
       env:
         LANGTOOLS_DICTS: ${{ steps.dicts.outputs.dir }}
         PYTHONPATH: ${{ steps.deps.outputs.lib }}
-        LT_URL: ${{ inputs.lt-url || 'http://localhost:8081/v2/check' }}
+        INPUT_LT_URL: ${{ inputs.lt-url }}
         PY: ${{ steps.deps.outputs.python }}
         INPUT_FILES: ${{ inputs.files }}
         INPUT_LANG: ${{ inputs.lang }}
@@ -135,6 +117,21 @@ runs:
         INPUT_DISABLE: ${{ inputs.disable-rules }}
       run: |
         shopt -s globstar
+        # LanguageTool runs inside this step so the trap removes the container however the step ends
+        # (composite actions have no post step). See scripts/languagetool.sh.
+        source "$GITHUB_ACTION_PATH/scripts/languagetool.sh"
+        trap lt_stop EXIT
+        export LT_URL="${INPUT_LT_URL:-$LT_DEFAULT_URL}"
+        if [ "$INPUT_LT" = "true" ] && [ -z "$INPUT_LT_URL" ]; then
+          if [ "$RUNNER_OS" != "Linux" ]; then
+            msg="The LanguageTool container needs a Linux runner, this one is $RUNNER_OS. Use runs-on: ubuntu-latest, point lt-url at a server you run, or set languagetool: false."
+            if [ "$INPUT_STRICT" = "true" ]; then echo "::error::$msg"; exit 1; fi
+            echo "::warning::$msg Continuing because strict is false: grammar will not be checked."
+          elif ! lt_start; then
+            echo "::warning::LanguageTool did not start; the check will report grammar as not checked (exit code 3 when strict)"
+          fi
+          export LT_URL
+        fi
         report="$RUNNER_TEMP/copy-langcheck-report.json"
         args=(--json-out "$report")
         [ -n "$INPUT_LANG" ] && args+=(--lang "$INPUT_LANG")
