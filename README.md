@@ -66,7 +66,7 @@ jobs:
   langcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: terezakohutova/copy-langcheck@main
         with:
           files: copy/cz-ads.json copy/sk-landing.html
