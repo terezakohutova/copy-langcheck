@@ -33,6 +33,6 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: dicts
-          key: dicts-${{ hashFiles('fetch_dicts.py') }}
+          key: dicts-${{ hashFiles('fetch_dicts.py', 'langcheck.py') }}
       - run: python fetch_dicts.py
       - run: python -m unittest -v

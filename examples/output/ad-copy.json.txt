@@ -1,11 +1,8 @@
-# Captured 2026-10-13 with langcheck.py 1.1.0, LT_URL=https://api.languagetool.org/v2/check
+# Captured 2026-10-13 with langcheck.py 1.2.0, LT_URL=https://api.languagetool.org/v2/check (not used: Czech has no LanguageTool module)
 $ python langcheck.py --online examples/ad-copy.json
-[hunspell] "kamarada" -> kamaráda, Kamrada, kamarádka  (unknown word)  in: Pozvi kamarada a ziskej odmenu
-[hunspell] "ziskej" -> získej, ziskem  (unknown word)  in: Pozvi kamarada a ziskej odmenu
-[hunspell] "odmenu" -> odměnu, podmenu, odmetu  (unknown word)  in: Pozvi kamarada a ziskej odmenu
-[korektor] "kamarada" -> kamaráda  (spelling/diacritics)  in: Pozvi kamarada a ziskej odmenu
-[korektor] "ziskej" -> ziskem  (spelling/diacritics)  in: Pozvi kamarada a ziskej odmenu
-[korektor] "odmenu" -> odměnu  (spelling/diacritics)  in: Pozvi kamarada a ziskej odmenu
-4 texts checked in cs by hunspell, korektor
-6 findings
+examples/ad-copy.json:3:21: [hunspell +korektor] "kamarada" -> kamaráda, Kamrada, kamarádka  (unknown word)  in: Pozvi kamarada a ziskej odmenu
+examples/ad-copy.json:3:32: [hunspell +korektor] "ziskej" -> získej, ziskem  (unknown word)  in: Pozvi kamarada a ziskej odmenu
+examples/ad-copy.json:3:39: [hunspell +korektor] "odmenu" -> odměnu, podmenu, odmetu  (unknown word)  in: Pozvi kamarada a ziskej odmenu
+4 texts checked in cs-CZ by hunspell, korektor
+3 findings
 (exit 1)

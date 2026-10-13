@@ -1,9 +1,7 @@
-# Captured 2026-10-13 with langcheck.py 1.1.0, LT_URL=https://api.languagetool.org/v2/check
+# Captured 2026-10-13 with langcheck.py 1.2.0, LT_URL=https://api.languagetool.org/v2/check
 $ python langcheck.py examples/landing-pl.html
-[hunspell] "nagrode" -> nagrodę, nagroda, nagrodo  (unknown word)  in: Zgarnij nagrode za polecenie
-[hunspell] "Sprawdz" -> Sprawdź, Sprawdza, Sprawdzi  (unknown word)  in: Sprawdz swoje wydatki w jednym miejscu i oszczędzaj bez wysiłku.
-[languagetool MORFOLOGIK_RULE_PL_PL] "nagrode" -> nagrodę, Nagrodę, nagrody  (Wykryto prawdopodobny błąd pisowni)  in: Zgarnij nagrode za polecenie
-[languagetool MORFOLOGIK_RULE_PL_PL] "Sprawdz" -> Sprawdź, Sprawdza, Sprawdzi  (Wykryto prawdopodobny błąd pisowni)  in: Sprawdz swoje wydatki w jednym miejscu i oszczędzaj bez wysiłku.
-4 texts checked in pl by hunspell, languagetool
-4 findings
+examples/landing-pl.html:5:15: [hunspell +languagetool MORFOLOGIK_RULE_PL_PL] "nagrode" -> nagrodę, nagroda, nagrodo, Nagrodę, nagrody  (unknown word)  in: Zgarnij nagrode za polecenie
+examples/landing-pl.html:6:6: [hunspell +languagetool MORFOLOGIK_RULE_PL_PL] "Sprawdz" -> Sprawdź, Sprawdza, Sprawdzi  (unknown word)  in: Sprawdz swoje wydatki w jednym miejscu i oszczędzaj bez wysiłku.
+5 texts checked in pl-PL by hunspell, languagetool
+2 findings
 (exit 1)

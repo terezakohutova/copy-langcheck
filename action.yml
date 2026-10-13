@@ -8,7 +8,11 @@ inputs:
     description: Files to check (text, Markdown, HTML or JSON). Separated by spaces, or one per line when a path has spaces. Globs like copy/*.json work.
     required: true
   lang:
-    description: Language (cs, sk, pl, de, en). Leave empty when every file states its own (HTML lang, JSON "lang").
+    description: Language for texts that do not state their own (cs, sk, pl, de, de-AT, de-CH, en, en-US). A file's own HTML lang or JSON "lang" wins.
+    required: false
+    default: ''
+  force-lang:
+    description: Use this language for everything, even where a file states another.
     required: false
     default: ''
   all-strings:
@@ -16,40 +20,72 @@ inputs:
     required: false
     default: 'false'
   languagetool:
-    description: Start a LanguageTool server for grammar (sk, pl, de, en). Adds about a minute.
+    description: Grammar for sk, pl, de, en. Starts a pinned LanguageTool container (Linux runners only), unless lt-url is set. Adds about a minute.
     required: false
     default: 'true'
+  lt-url:
+    description: Use this LanguageTool server instead of starting a container, for example on macOS or Windows runners (http://host:port/v2/check).
+    required: false
+    default: ''
   online:
     description: Also use Korektor (public LINDAT API) for Czech. Sends the text to a third party; its models are CC BY-NC-SA, so commercial use needs the authors' permission.
     required: false
     default: 'false'
   strict:
-    description: Fail (exit code 3) when any layer that applies could not run, for example LanguageTool did not start.
+    description: Fail (exit code 3) when a layer that applies could not check every text, for example LanguageTool did not start. 'false' passes --lenient.
     required: false
-    default: 'false'
+    default: 'true'
   ignore:
-    description: Path to a file with words that are right on purpose, one per line.
+    description: Path to a file with words that are right on purpose, one per line (i:word = any case, rule:ID = switch off a LanguageTool rule).
+    required: false
+    default: ''
+  disable-rules:
+    description: LanguageTool rule ids to switch off, comma-separated.
     required: false
     default: ''
 outputs:
   exit-code:
     description: 0 clean, 1 findings, 2 bad input, 3 could not check.
     value: ${{ steps.check.outputs.exit-code }}
+  report:
+    description: Path of the JSON report (findings with file, line and column; which layers ran). Not written on exit code 2.
+    value: ${{ steps.check.outputs.report }}
 runs:
   using: composite
   steps:
-    - uses: actions/setup-python@v6
+    # Use the job's Python when it is 3.10 or newer; only set one up when there is none.
+    - name: Find Python
+      id: python
+      shell: bash
+      run: |
+        for c in python3 python; do
+          if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
+            echo "found=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+        done
+        echo "found=false" >> "$GITHUB_OUTPUT"
+    - if: steps.python.outputs.found != 'true'
+      uses: actions/setup-python@v6
       with:
         python-version: '3.12'
+    # spylls goes to a private folder on PYTHONPATH, so the job's own packages are not touched.
     - name: Install spylls
+      id: deps
       shell: bash
-      run: python -m pip install -q -r "$GITHUB_ACTION_PATH/requirements.txt"
+      run: |
+        for c in python3 python; do
+          if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then py="$c"; break; fi
+        done
+        lib="$RUNNER_TEMP/copy-langcheck-lib"
+        "$py" -m pip install -q --disable-pip-version-check --target "$lib" -r "$GITHUB_ACTION_PATH/requirements.txt"
+        echo "python=$py" >> "$GITHUB_OUTPUT"
+        echo "lib=$lib" >> "$GITHUB_OUTPUT"
     - name: Dictionary cache key
       id: dicts
       shell: bash
       run: |
         echo "dir=$RUNNER_TEMP/copy-langcheck-dicts" >> "$GITHUB_OUTPUT"
-        echo "key=copy-langcheck-dicts-$(sha256sum "$GITHUB_ACTION_PATH/fetch_dicts.py" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        echo "key=copy-langcheck-dicts-$(cat "$GITHUB_ACTION_PATH/fetch_dicts.py" "$GITHUB_ACTION_PATH/langcheck.py" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
     - uses: actions/cache@v5
       with:
         path: ${{ steps.dicts.outputs.dir }}
@@ -58,38 +94,57 @@ runs:
       shell: bash
       env:
         LANGTOOLS_DICTS: ${{ steps.dicts.outputs.dir }}
-      run: python "$GITHUB_ACTION_PATH/fetch_dicts.py"
+        PYTHONPATH: ${{ steps.deps.outputs.lib }}
+      run: '"${{ steps.deps.outputs.python }}" "$GITHUB_ACTION_PATH/fetch_dicts.py"'
     - name: Start LanguageTool
-      if: inputs.languagetool == 'true'
+      if: inputs.languagetool == 'true' && inputs.lt-url == ''
       shell: bash
+      env:
+        INPUT_STRICT: ${{ inputs.strict }}
       run: |
-        docker run -d --name languagetool -p 8081:8010 erikvl87/languagetool:6.8 >/dev/null
+        if [ "$RUNNER_OS" != "Linux" ]; then
+          msg="The LanguageTool container needs a Linux runner, this one is $RUNNER_OS. Use runs-on: ubuntu-latest, point lt-url at a server you run, or set languagetool: false."
+          if [ "$INPUT_STRICT" = "true" ]; then echo "::error::$msg"; exit 1; fi
+          echo "::warning::$msg Continuing because strict is false: grammar will not be checked."
+          exit 0
+        fi
+        # erikvl87/languagetool:6.8, pinned to the multi-arch index digest it had on 2026-10-13.
+        docker run -d --name languagetool -p 8081:8010 \
+          erikvl87/languagetool:6.8@sha256:ef8fa12cbd485166c9ceeb7139d76d56d07707a624da6bb1fc1fbb5411750527 >/dev/null
         for i in $(seq 1 60); do
           curl -sf "http://localhost:8081/v2/check?language=en-GB&text=Test." >/dev/null && { echo "LanguageTool up after $((i * 2)) s"; exit 0; }
           sleep 2
         done
-        echo "::warning::LanguageTool did not start, grammar will not be checked"
+        echo "::warning::LanguageTool did not start; the check will report grammar as not checked (exit code 3 when strict)"
     - name: Check the copy
       id: check
       shell: bash
       env:
         LANGTOOLS_DICTS: ${{ steps.dicts.outputs.dir }}
+        PYTHONPATH: ${{ steps.deps.outputs.lib }}
+        LT_URL: ${{ inputs.lt-url || 'http://localhost:8081/v2/check' }}
+        PY: ${{ steps.deps.outputs.python }}
         INPUT_FILES: ${{ inputs.files }}
         INPUT_LANG: ${{ inputs.lang }}
+        INPUT_FORCE_LANG: ${{ inputs.force-lang }}
         INPUT_ALL: ${{ inputs.all-strings }}
         INPUT_LT: ${{ inputs.languagetool }}
         INPUT_ONLINE: ${{ inputs.online }}
         INPUT_STRICT: ${{ inputs.strict }}
         INPUT_IGNORE: ${{ inputs.ignore }}
+        INPUT_DISABLE: ${{ inputs.disable-rules }}
       run: |
         shopt -s globstar
-        args=()
+        report="$RUNNER_TEMP/copy-langcheck-report.json"
+        args=(--json-out "$report")
         [ -n "$INPUT_LANG" ] && args+=(--lang "$INPUT_LANG")
+        [ -n "$INPUT_FORCE_LANG" ] && args+=(--force-lang "$INPUT_FORCE_LANG")
         [ "$INPUT_ALL" = "true" ] && args+=(--all-strings)
         [ "$INPUT_LT" = "true" ] || args+=(--no-languagetool)
         [ "$INPUT_ONLINE" = "true" ] && args+=(--online)
-        [ "$INPUT_STRICT" = "true" ] && args+=(--strict)
+        [ "$INPUT_STRICT" = "true" ] || args+=(--lenient)
         [ -n "$INPUT_IGNORE" ] && args+=(--ignore "$INPUT_IGNORE")
+        [ -n "$INPUT_DISABLE" ] && args+=(--disable-rule "$INPUT_DISABLE")
         # One path per line when there are several lines (paths may contain spaces),
         # otherwise space-separated. Globs are expanded; an unmatched one stays as
         # written, so langcheck reports "file not found" instead of skipping it.
@@ -109,6 +164,7 @@ runs:
           done
         done
         status=0
-        python "$GITHUB_ACTION_PATH/langcheck.py" "${args[@]}" -- "${files[@]}" || status=$?
+        "$PY" "$GITHUB_ACTION_PATH/langcheck.py" "${args[@]}" -- "${files[@]}" || status=$?
         echo "exit-code=$status" >> "$GITHUB_OUTPUT"
+        [ -f "$report" ] && echo "report=$report" >> "$GITHUB_OUTPUT"
         exit $status

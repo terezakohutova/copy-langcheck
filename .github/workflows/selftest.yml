@@ -1,6 +1,6 @@
 # End-to-end test of the composite action on a real runner, with a real
-# LanguageTool container. Checks exact exit codes, so a crash or a failed
-# install cannot pass for "the mistakes were caught".
+# LanguageTool container. Checks exact exit codes and the JSON report, so a crash,
+# a failed install or a layer that never ran cannot pass for "the mistakes were caught".
 name: selftest
 on:
   push:
@@ -16,8 +16,7 @@ jobs:
         uses: ./
         with:
           files: examples/clean-sk.txt
-          lang: sk
-          strict: true          # 0 here also proves LanguageTool really ran
+          lang: sk              # strict is the default: 0 here also proves LanguageTool really ran
       - name: Exit code must be 0
         run: test "${{ steps.check.outputs.exit-code }}" = 0
 
@@ -40,6 +39,31 @@ jobs:
           fi
           echo "caught, as expected"
 
+  grammar-only-mistake-is-caught-by-languagetool:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: check
+        uses: ./
+        continue-on-error: true
+        with:
+          files: examples/grammar-de.txt   # every word is in the dictionary; only the grammar is wrong
+          lang: de
+      - name: Only LanguageTool may report it, and it must have run
+        env:
+          REPORT: ${{ steps.check.outputs.report }}
+        run: |
+          test "${{ steps.check.outputs.exit-code }}" = 1
+          python3 - "$REPORT" <<'EOF'
+          import json, sys
+          rep = json.load(open(sys.argv[1], encoding='utf-8'))
+          tools = {f['tool'] for f in rep['findings']}
+          ran = rep['checked']['de-DE']['ran']
+          print('tools:', tools, 'ran:', ran)
+          assert tools == {'languagetool'}, tools
+          assert ran == ['hunspell', 'languagetool'], ran
+          EOF
+
   missing-file-is-an-error:
     runs-on: ubuntu-latest
     steps:
@@ -52,3 +76,17 @@ jobs:
           languagetool: false
       - name: A typo in a path must not pass (exit code 2)
         run: test "${{ steps.check.outputs.exit-code }}" = 2
+
+  languagetool-container-needs-linux:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: check
+        uses: ./
+        continue-on-error: true
+        with:
+          files: examples/clean-sk.txt
+          lang: sk
+      - name: Strict mode must fail clearly instead of skipping grammar
+        shell: bash
+        run: test "${{ steps.check.outcome }}" = failure

@@ -1,0 +1,17 @@
+# Example ignore list. Copy it next to your copy, edit, and pass it with --ignore.
+# One entry per line; lines starting with # are comments.
+#
+# Case-sensitive by default, like Hunspell: a lowercase entry also covers
+# Capitalised and UPPERCASE forms, an entry with capitals covers itself and UPPERCASE.
+# So a brand written the wrong way round is still a finding.
+Zorbly
+SuperSaver
+# Slang and loanwords your copy uses on purpose (Czech "appka" and its forms).
+appka
+appku
+appce
+appky
+# i: matches in any case.
+i:cashbackem
+# rule: switches off a LanguageTool rule for every file checked with this list.
+rule:EN_COMPOUNDS

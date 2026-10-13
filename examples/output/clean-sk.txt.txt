@@ -1,5 +1,5 @@
-# Captured 2026-10-13 with langcheck.py 1.1.0, LT_URL=https://api.languagetool.org/v2/check
+# Captured 2026-10-13 with langcheck.py 1.2.0, LT_URL=https://api.languagetool.org/v2/check
 $ python langcheck.py --lang sk examples/clean-sk.txt
-2 texts checked in sk by hunspell, languagetool
+2 texts checked in sk-SK by hunspell, languagetool
 clean
 (exit 0)
