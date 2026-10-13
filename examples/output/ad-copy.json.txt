@@ -1,9 +1,11 @@
-$ python langcheck.py examples/ad-copy.json
+# Captured 2026-10-13 with langcheck.py 1.1.0, LT_URL=https://api.languagetool.org/v2/check
+$ python langcheck.py --online examples/ad-copy.json
 [hunspell] "kamarada" -> kamaráda, Kamrada, kamarádka  (unknown word)  in: Pozvi kamarada a ziskej odmenu
 [hunspell] "ziskej" -> získej, ziskem  (unknown word)  in: Pozvi kamarada a ziskej odmenu
 [hunspell] "odmenu" -> odměnu, podmenu, odmetu  (unknown word)  in: Pozvi kamarada a ziskej odmenu
 [korektor] "kamarada" -> kamaráda  (spelling/diacritics)  in: Pozvi kamarada a ziskej odmenu
 [korektor] "ziskej" -> ziskem  (spelling/diacritics)  in: Pozvi kamarada a ziskej odmenu
 [korektor] "odmenu" -> odměnu  (spelling/diacritics)  in: Pozvi kamarada a ziskej odmenu
-4 texts checked in cs: 6 findings
+4 texts checked in cs by hunspell, korektor
+6 findings
 (exit 1)

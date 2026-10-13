@@ -1,2 +1,4 @@
-dicts/
+/dicts/
 __pycache__/
+.venv/
+*.part

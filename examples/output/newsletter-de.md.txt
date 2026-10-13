@@ -1,6 +1,8 @@
+# Captured 2026-10-13 with langcheck.py 1.1.0, LT_URL=https://api.languagetool.org/v2/check
 $ python langcheck.py --lang de examples/newsletter-de.md
 [hunspell] "Weihnachen" -> Weihnachten, Weihsachen, Weihaachen  (unknown word)  in: Neu: Mit die Sparziel-Funktion legst du fest, wie viel du bis Weihnachen zurücklegen willst, und wir erinnern dich, w...
 [languagetool DE_AGREEMENT] "ein gute Zeichen" -> ein gutes Zeichen  (Möglicherweise passen das Nomen und die Wörter, die das Nomen beschreiben, grammatisch nicht zusammen.)  in: Du hast diesen Monat weniger für Lieferdienste ausgegeben als im September. Das ist ein gute Zeichen!
 [languagetool PRAEP_DAT] "die" -> der  (Die Präposition „Mit“ erwartet den Dativ. Hier scheint „der“ der korrekte Artikel zu sein.)  in: Neu: Mit die Sparziel-Funktion legst du fest, wie viel du bis Weihnachen zurücklegen willst, und wir erinnern dich, w...
-4 texts checked in de: 3 findings
+4 texts checked in de by hunspell, languagetool
+3 findings
 (exit 1)

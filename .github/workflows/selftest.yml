@@ -1,3 +1,6 @@
+# End-to-end test of the composite action on a real runner, with a real
+# LanguageTool container. Checks exact exit codes, so a crash or a failed
+# install cannot pass for "the mistakes were caught".
 name: selftest
 on:
   push:
@@ -9,10 +12,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: ./
+      - id: check
+        uses: ./
         with:
           files: examples/clean-sk.txt
           lang: sk
+          strict: true          # 0 here also proves LanguageTool really ran
+      - name: Exit code must be 0
+        run: test "${{ steps.check.outputs.exit-code }}" = 0
 
   bad-copy-fails:
     runs-on: ubuntu-latest
@@ -22,10 +29,26 @@ jobs:
         uses: ./
         continue-on-error: true
         with:
-          files: examples/ad-copy.json examples/landing-pl.html
-      - name: The planted mistakes must be caught
+          files: |
+            examples/ad-copy.json
+            examples/landing-pl.html
+      - name: The planted mistakes must be caught (exit code 1, not a crash)
         run: |
-          if [ "${{ steps.check.outcome }}" != "failure" ]; then
-            echo "::error::the examples contain mistakes, the check should have failed"; exit 1
+          code="${{ steps.check.outputs.exit-code }}"
+          if [ "$code" != 1 ]; then
+            echo "::error::expected exit code 1 (findings), got '$code'"; exit 1
           fi
           echo "caught, as expected"
+
+  missing-file-is-an-error:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: check
+        uses: ./
+        continue-on-error: true
+        with:
+          files: examples/does-not-exist.json
+          languagetool: false
+      - name: A typo in a path must not pass (exit code 2)
+        run: test "${{ steps.check.outputs.exit-code }}" = 2
