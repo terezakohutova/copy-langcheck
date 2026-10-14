@@ -1058,6 +1058,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--no-suggest', action='store_true', help='no Hunspell suggestions at all (fastest)')
     p.add_argument('--json', action='store_true', help='machine-readable output')
     p.add_argument('--json-out', metavar='FILE', help='also write the machine-readable report to FILE')
+    p.add_argument('--github-annotations', action='store_true',
+                   help='also print GitHub Actions ::error lines, so findings show inline on a pull request')
     p.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
     return p
 
@@ -1140,6 +1142,30 @@ def render(rep: Report) -> str:
     return '\n'.join(lines)
 
 
+def _gh_escape(s: str, prop: bool = False) -> str:
+    s = s.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+    return s.replace(':', '%3A').replace(',', '%2C') if prop else s
+
+
+def github_annotations(rep: Report) -> str:
+    """GitHub Actions workflow commands: one ::error per finding, shown inline on the
+    pull request diff, plus one for an incomplete check."""
+    lines = []
+    for f in rep.findings:
+        props = [f'title={_gh_escape("copy-langcheck " + f.tool, True)}']
+        if not f.source.startswith('<'):
+            props.insert(0, f'file={_gh_escape(f.source, True)}')
+            if f.line:
+                props[1:1] = [f'line={f.line}', f'col={f.col}']
+        sug = ', '.join(f.suggest) or '?'
+        lines.append(f'::error {",".join(props)}::{_gh_escape(f"{f.found} -> {sug} ({f.message})")}')
+    if rep.exit_code == EXIT_UNCHECKED:
+        missing = [f"{tag} ({', '.join(c['skipped'])})" for tag, c in rep.checked.items() if c['skipped']]
+        missing += [f'lang="{lang}" (not supported)' for lang in rep.unsupported]
+        lines.append('::error title=copy-langcheck::' + _gh_escape('NOT CHECKED, did not run: ' + '; '.join(missing)))
+    return '\n'.join(lines)
+
+
 def report_json(rep: Report) -> str:
     return json.dumps({'version': __version__, 'exit_code': rep.exit_code, 'strict': rep.strict,
                        'checked': rep.checked, 'unsupported': rep.unsupported, 'notes': rep.notes,
@@ -1179,6 +1205,10 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.json_out, 'w', encoding='utf-8') as f:
             f.write(report_json(rep) + '\n')
     print(report_json(rep) if args.json else render(rep))
+    if args.github_annotations:
+        notes = github_annotations(rep)
+        if notes:
+            print(notes)
     return rep.exit_code
 
 

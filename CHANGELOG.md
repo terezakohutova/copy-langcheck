@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `--github-annotations` prints a GitHub Actions `::error file=...,line=...,col=...` line for every finding (and one for an incomplete check), so findings show inline on the pull request diff. The Action passes it.
+
+### Changed
+
+- **The Action skips Hunspell suggestions by default** (new input `suggest`, default `false`). Each suggestion is a search through the dictionary and takes seconds in pure Python; findings and exit codes are the same either way. The command line keeps its default (the first 20 unknown words per language get suggestions).
+- README slimmed to what it does, a demo, the Action and its limits. The full rules for each input format moved to [`docs/usage.md`](docs/usage.md). The example outputs were re-captured with 1.3.0 (only the header line changed).
+
+### Still deprecated, still working
+
+These shims stay until 2.0 so nothing that worked with `v1` breaks: quoted copy as a plain argument (use `--text`) and `--no-online` (off is the default). Both print a notice.
+
 ## 1.3.0 (2026-10-14)
 
 Fixes from a second outside review. Two changes can turn a result that used to pass into a failure, see **Changed behaviour**.

@@ -43,6 +43,10 @@ inputs:
     description: LanguageTool rule ids to switch off, comma-separated.
     required: false
     default: ''
+  suggest:
+    description: Hunspell suggestions for unknown words. Off by default in the Action because each one takes seconds in pure Python; findings are reported either way.
+    required: false
+    default: 'false'
 outputs:
   exit-code:
     description: 0 clean, 1 findings, 2 bad input, 3 could not check.
@@ -115,6 +119,7 @@ runs:
         INPUT_STRICT: ${{ inputs.strict }}
         INPUT_IGNORE: ${{ inputs.ignore }}
         INPUT_DISABLE: ${{ inputs.disable-rules }}
+        INPUT_SUGGEST: ${{ inputs.suggest }}
       run: |
         shopt -s globstar
         # LanguageTool runs inside this step so the trap removes the container however the step ends
@@ -133,7 +138,9 @@ runs:
           export LT_URL
         fi
         report="$RUNNER_TEMP/copy-langcheck-report.json"
-        args=(--json-out "$report")
+        # ::error lines put each finding on its line in the pull request diff.
+        args=(--json-out "$report" --github-annotations)
+        [ "$INPUT_SUGGEST" = "true" ] || args+=(--no-suggest)
         [ -n "$INPUT_LANG" ] && args+=(--lang "$INPUT_LANG")
         [ -n "$INPUT_FORCE_LANG" ] && args+=(--force-lang "$INPUT_FORCE_LANG")
         [ "$INPUT_ALL" = "true" ] && args+=(--all-strings)

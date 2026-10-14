@@ -528,8 +528,8 @@ class PackagingTest(unittest.TestCase):
     def test_readme_headline(self):
         with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:
             head = f.read(1500)
-        self.assertIn('grammar for SK/PL/DE/EN via LanguageTool', head)
-        self.assertIn('Czech spelling, grammar via optional Korektor', head)
+        self.assertIn('Czech is spelling only', head)
+        self.assertNotIn('grammar via optional Korektor', head)     # Korektor is spelling, not grammar
 
 
 if __name__ == '__main__':

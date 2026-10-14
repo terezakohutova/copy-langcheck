@@ -1,4 +1,4 @@
-# Captured 2026-10-13 with langcheck.py 1.2.0, LT_URL=https://api.languagetool.org/v2/check
+# Captured 2026-10-14 with langcheck.py 1.3.0, LT_URL=https://api.languagetool.org/v2/check
 $ python langcheck.py --lang de examples/grammar-de.txt
 examples/grammar-de.txt:1:9: [languagetool DE_AGREEMENT] "ein gute Zeichen" -> ein gutes Zeichen  (Möglicherweise passen das Nomen und die Wörter, die das Nomen beschreiben, grammatisch nicht zusammen.)  in: Das ist ein gute Zeichen.
 examples/grammar-de.txt:3:5: [languagetool PRAEP_DAT] "die" -> der  (Die Präposition „Mit“ erwartet den Dativ. Hier scheint „der“ der korrekte Artikel zu sein.)  in: Mit die Sparziel-Funktion legst du fest, wie viel du zurücklegen willst.

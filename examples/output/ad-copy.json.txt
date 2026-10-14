@@ -1,4 +1,4 @@
-# Captured 2026-10-13 with langcheck.py 1.2.0, LT_URL=https://api.languagetool.org/v2/check (not used: Czech has no LanguageTool module)
+# Captured 2026-10-14 with langcheck.py 1.3.0, LT_URL=https://api.languagetool.org/v2/check (not used: Czech has no LanguageTool module)
 $ python langcheck.py --online examples/ad-copy.json
 examples/ad-copy.json:3:21: [hunspell +korektor] "kamarada" -> kamaráda, Kamrada, kamarádka  (unknown word)  in: Pozvi kamarada a ziskej odmenu
 examples/ad-copy.json:3:32: [hunspell +korektor] "ziskej" -> získej, ziskem  (unknown word)  in: Pozvi kamarada a ziskej odmenu
