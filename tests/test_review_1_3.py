@@ -521,9 +521,10 @@ class PackagingTest(unittest.TestCase):
         self.assertEqual(len(re.findall(r'--hash=sha256:[0-9a-f]{64}', req)), 2)
 
     def test_version(self):
-        self.assertEqual(langcheck.__version__, '1.3.0')
+        # The newest CHANGELOG entry is the version the code reports.
         with open(os.path.join(ROOT, 'CHANGELOG.md'), encoding='utf-8') as f:
-            self.assertIn('## 1.3.0', f.read())
+            newest = re.search(r'^## (\S+)', f.read(), re.M).group(1)
+        self.assertEqual(langcheck.__version__, newest)
 
     def test_readme_headline(self):
         with open(os.path.join(ROOT, 'README.md'), encoding='utf-8') as f:

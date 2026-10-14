@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 (2026-10-14)
+
+Nothing that passed before fails now. The Action shows findings on the pull request and runs faster.
 
 ### Added
 
